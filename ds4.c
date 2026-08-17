@@ -576,6 +576,48 @@ static const ds4_shape DS4_SHAPE_FLASH = {
     .rope_orig_ctx = DS4_DEFAULT_ROPE_ORIG_CTX,
 };
 
+/* REAP-pruned Flash checkpoint (Cerebras REAP one-shot expert pruning,
+ * K=144 experts kept, e.g. 0xSero/DeepSeek-V4-Flash-162B). Identical to
+ * DS4_SHAPE_FLASH except the routed expert count; all downstream code is
+ * data-driven via g_ds4_shape so no other changes are required. */
+static const ds4_shape DS4_SHAPE_FLASH_REAP144 = {
+    .name = "DeepSeek V4 Flash REAP-144",
+    .family = DS4_MODEL_FAMILY_DEEPSEEK4,
+    .variant = DS4_VARIANT_FLASH,
+    .n_layer = 43,
+    .n_embd = 4096,
+    .n_vocab = 129280,
+    .n_head = 64,
+    .n_head_kv = 1,
+    .n_head_dim = 512,
+    .n_value_dim = 512,
+    .n_rot = 64,
+    .n_out_group = 8,
+    .n_lora_q = 1024,
+    .n_lora_o = 1024,
+    .n_expert = 144,
+    .n_expert_used = 6,
+    .n_expert_shared = 1,
+    .n_ff_exp = 2048,
+    .n_hash_layer = 3,
+    .n_swa = 128,
+    .n_indexer_head = 64,
+    .n_indexer_head_dim = 128,
+    .n_indexer_top_k = 512,
+    .n_hc = 4,
+    .n_hc_sinkhorn_iter = 20,
+    .rms_eps = DS4_DEFAULT_RMS_EPS,
+    .hc_eps = DS4_DEFAULT_HC_EPS,
+    .expert_weight_scale = 1.5f,
+    .swiglu_clamp_exp = DS4_DEFAULT_SWIGLU_CLAMP_EXP,
+    .rope_freq_base = DS4_DEFAULT_ROPE_FREQ_BASE,
+    .rope_scale_factor = DS4_DEFAULT_ROPE_SCALE_FACTOR,
+    .rope_yarn_beta_fast = DS4_DEFAULT_ROPE_YARN_BETA_FAST,
+    .rope_yarn_beta_slow = DS4_DEFAULT_ROPE_YARN_BETA_SLOW,
+    .compress_rope_freq_base = DS4_DEFAULT_COMPRESS_ROPE_FREQ_BASE,
+    .rope_orig_ctx = DS4_DEFAULT_ROPE_ORIG_CTX,
+};
+
 static const ds4_shape DS4_SHAPE_PRO = {
     .name = "DeepSeek V4 Pro",
     .family = DS4_MODEL_FAMILY_DEEPSEEK4,
@@ -5510,6 +5552,17 @@ static void ds4_select_shape_from_metadata(
                                    n_indexer_head_dim, n_indexer_top_k, n_hc,
                                    n_hc_sinkhorn_iter)) {
         g_ds4_shape = DS4_SHAPE_PRO;
+        return;
+    }
+    if (ds4_shape_matches_metadata(&DS4_SHAPE_FLASH_REAP144,
+                                   n_layer, n_embd, n_vocab, n_head, n_head_kv,
+                                   n_head_dim, n_value_dim, n_rot, n_lora_q,
+                                   n_lora_o, n_out_group, n_expert,
+                                   n_expert_used, n_ff_exp, n_expert_shared,
+                                   n_hash_layer, n_swa, n_indexer_head,
+                                   n_indexer_head_dim, n_indexer_top_k, n_hc,
+                                   n_hc_sinkhorn_iter)) {
+        g_ds4_shape = DS4_SHAPE_FLASH_REAP144;
         return;
     }
 
