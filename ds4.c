@@ -576,47 +576,12 @@ static const ds4_shape DS4_SHAPE_FLASH = {
     .rope_orig_ctx = DS4_DEFAULT_ROPE_ORIG_CTX,
 };
 
-/* REAP-pruned Flash checkpoint (Cerebras REAP one-shot expert pruning,
- * K=144 experts kept, e.g. 0xSero/DeepSeek-V4-Flash-162B). Identical to
- * DS4_SHAPE_FLASH except the routed expert count; all downstream code is
- * data-driven via g_ds4_shape so no other changes are required. */
-static const ds4_shape DS4_SHAPE_FLASH_REAP144 = {
-    .name = "DeepSeek V4 Flash REAP-144",
-    .family = DS4_MODEL_FAMILY_DEEPSEEK4,
-    .variant = DS4_VARIANT_FLASH,
-    .n_layer = 43,
-    .n_embd = 4096,
-    .n_vocab = 129280,
-    .n_head = 64,
-    .n_head_kv = 1,
-    .n_head_dim = 512,
-    .n_value_dim = 512,
-    .n_rot = 64,
-    .n_out_group = 8,
-    .n_lora_q = 1024,
-    .n_lora_o = 1024,
-    .n_expert = 144,
-    .n_expert_used = 6,
-    .n_expert_shared = 1,
-    .n_ff_exp = 2048,
-    .n_hash_layer = 3,
-    .n_swa = 128,
-    .n_indexer_head = 64,
-    .n_indexer_head_dim = 128,
-    .n_indexer_top_k = 512,
-    .n_hc = 4,
-    .n_hc_sinkhorn_iter = 20,
-    .rms_eps = DS4_DEFAULT_RMS_EPS,
-    .hc_eps = DS4_DEFAULT_HC_EPS,
-    .expert_weight_scale = 1.5f,
-    .swiglu_clamp_exp = DS4_DEFAULT_SWIGLU_CLAMP_EXP,
-    .rope_freq_base = DS4_DEFAULT_ROPE_FREQ_BASE,
-    .rope_scale_factor = DS4_DEFAULT_ROPE_SCALE_FACTOR,
-    .rope_yarn_beta_fast = DS4_DEFAULT_ROPE_YARN_BETA_FAST,
-    .rope_yarn_beta_slow = DS4_DEFAULT_ROPE_YARN_BETA_SLOW,
-    .compress_rope_freq_base = DS4_DEFAULT_COMPRESS_ROPE_FREQ_BASE,
-    .rope_orig_ctx = DS4_DEFAULT_ROPE_ORIG_CTX,
-};
+/* REAP-pruned Flash checkpoints (Cerebras REAP one-shot expert pruning,
+ * e.g. 0xSero/DeepSeek-V4-Flash-162B keeps K=144 of 256 experts) are NOT
+ * listed as separate shapes: pruning changes only the routed-expert count
+ * and leaves every other dimension identical, so ds4_select_shape_from_
+ * metadata() matches the base Flash architecture ignoring n_expert and
+ * overrides it from GGUF metadata. No per-pruning-ratio entry needed. */
 
 static const ds4_shape DS4_SHAPE_PRO = {
     .name = "DeepSeek V4 Pro",
@@ -5461,7 +5426,7 @@ static void dspark_weights_validate_layout(ds4_dspark_weights *dw) {
                                   1, 0);
 }
 
-static bool ds4_shape_matches_metadata(
+static bool ds4_shape_matches_metadata_base(
         const ds4_shape *s,
         uint32_t n_layer,
         uint32_t n_embd,
@@ -5474,7 +5439,6 @@ static bool ds4_shape_matches_metadata(
         uint32_t n_lora_q,
         uint32_t n_lora_o,
         uint32_t n_out_group,
-        uint32_t n_expert,
         uint32_t n_expert_used,
         uint32_t n_ff_exp,
         uint32_t n_expert_shared,
@@ -5496,7 +5460,6 @@ static bool ds4_shape_matches_metadata(
            s->n_lora_q == n_lora_q &&
            s->n_lora_o == n_lora_o &&
            s->n_out_group == n_out_group &&
-           s->n_expert == n_expert &&
            s->n_expert_used == n_expert_used &&
            s->n_ff_exp == n_ff_exp &&
            s->n_expert_shared == n_expert_shared &&
@@ -5507,6 +5470,30 @@ static bool ds4_shape_matches_metadata(
            s->n_indexer_top_k == n_indexer_top_k &&
            s->n_hc == n_hc &&
            s->n_hc_sinkhorn_iter == n_hc_sinkhorn_iter;
+}
+
+/* Buffer for the shape name when the routed-expert count is overridden
+ * from metadata (pruned Flash checkpoints). g_ds4_shape.name is a pointer
+ * into this buffer; a static allocation keeps it valid for the process
+ * lifetime like the other shape name literals. */
+static char g_ds4_shape_name_buf[96];
+
+/* Select a base shape (matched ignoring n_expert), then stamp the routed-
+ * expert count read from GGUF metadata onto it. REAP-144 keeps an explicit
+ * name as the known fallback; any other pruned count is labeled with the
+ * actual expert number so --shape-dump and startup logs stay truthful. */
+static void ds4_shape_select_with_experts(const ds4_shape *base,
+                                          uint32_t n_expert,
+                                          const char *known_name) {
+    g_ds4_shape = *base;
+    g_ds4_shape.n_expert = n_expert;
+    if (known_name) {
+        g_ds4_shape.name = known_name;
+    } else {
+        snprintf(g_ds4_shape_name_buf, sizeof(g_ds4_shape_name_buf),
+                 "%s (%u routed experts)", base->name, n_expert);
+        g_ds4_shape.name = g_ds4_shape_name_buf;
+    }
 }
 
 static void ds4_select_shape_from_metadata(
@@ -5532,37 +5519,40 @@ static void ds4_select_shape_from_metadata(
         uint32_t n_indexer_top_k,
         uint32_t n_hc,
         uint32_t n_hc_sinkhorn_iter) {
-    if (ds4_shape_matches_metadata(&DS4_SHAPE_FLASH,
-                                   n_layer, n_embd, n_vocab, n_head, n_head_kv,
-                                   n_head_dim, n_value_dim, n_rot, n_lora_q,
-                                   n_lora_o, n_out_group, n_expert,
-                                   n_expert_used, n_ff_exp, n_expert_shared,
-                                   n_hash_layer, n_swa, n_indexer_head,
-                                   n_indexer_head_dim, n_indexer_top_k, n_hc,
-                                   n_hc_sinkhorn_iter)) {
-        g_ds4_shape = DS4_SHAPE_FLASH;
+    /* Match the base architecture ignoring n_expert: pruning (REAP and any
+     * future ratio) changes only the routed-expert count, so the base shape
+     * is selected first and n_expert is stamped from the GGUF metadata.
+     * REAP-144 is the known explicit fallback and keeps its name. */
+    if (ds4_shape_matches_metadata_base(&DS4_SHAPE_FLASH,
+                                        n_layer, n_embd, n_vocab, n_head,
+                                        n_head_kv, n_head_dim, n_value_dim,
+                                        n_rot, n_lora_q, n_lora_o, n_out_group,
+                                        n_expert_used, n_ff_exp,
+                                        n_expert_shared, n_hash_layer, n_swa,
+                                        n_indexer_head, n_indexer_head_dim,
+                                        n_indexer_top_k, n_hc,
+                                        n_hc_sinkhorn_iter)) {
+        if (n_expert == DS4_SHAPE_FLASH.n_expert) {
+            g_ds4_shape = DS4_SHAPE_FLASH;
+        } else if (n_expert == 144) {
+            ds4_shape_select_with_experts(&DS4_SHAPE_FLASH, n_expert,
+                                          "DeepSeek V4 Flash REAP-144");
+        } else {
+            ds4_shape_select_with_experts(&DS4_SHAPE_FLASH, n_expert, NULL);
+        }
         return;
     }
-    if (ds4_shape_matches_metadata(&DS4_SHAPE_PRO,
-                                   n_layer, n_embd, n_vocab, n_head, n_head_kv,
-                                   n_head_dim, n_value_dim, n_rot, n_lora_q,
-                                   n_lora_o, n_out_group, n_expert,
-                                   n_expert_used, n_ff_exp, n_expert_shared,
-                                   n_hash_layer, n_swa, n_indexer_head,
-                                   n_indexer_head_dim, n_indexer_top_k, n_hc,
-                                   n_hc_sinkhorn_iter)) {
+    if (n_expert == DS4_SHAPE_PRO.n_expert &&
+        ds4_shape_matches_metadata_base(&DS4_SHAPE_PRO,
+                                        n_layer, n_embd, n_vocab, n_head,
+                                        n_head_kv, n_head_dim, n_value_dim,
+                                        n_rot, n_lora_q, n_lora_o, n_out_group,
+                                        n_expert_used, n_ff_exp,
+                                        n_expert_shared, n_hash_layer, n_swa,
+                                        n_indexer_head, n_indexer_head_dim,
+                                        n_indexer_top_k, n_hc,
+                                        n_hc_sinkhorn_iter)) {
         g_ds4_shape = DS4_SHAPE_PRO;
-        return;
-    }
-    if (ds4_shape_matches_metadata(&DS4_SHAPE_FLASH_REAP144,
-                                   n_layer, n_embd, n_vocab, n_head, n_head_kv,
-                                   n_head_dim, n_value_dim, n_rot, n_lora_q,
-                                   n_lora_o, n_out_group, n_expert,
-                                   n_expert_used, n_ff_exp, n_expert_shared,
-                                   n_hash_layer, n_swa, n_indexer_head,
-                                   n_indexer_head_dim, n_indexer_top_k, n_hc,
-                                   n_hc_sinkhorn_iter)) {
-        g_ds4_shape = DS4_SHAPE_FLASH_REAP144;
         return;
     }
 
@@ -58131,6 +58121,46 @@ void ds4_engine_summary(ds4_engine *e) {
                    e->dspark_weights.metadata_errors);
         }
     }
+}
+
+void ds4_engine_shape_dump(ds4_engine *e) {
+    (void)e;
+    printf("shape: %s\n", DS4_MODEL_SHAPE_NAME);
+    printf("family: %s\n", DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK4
+                                ? "deepseek4" : "glm-dsa");
+    printf("variant: %s\n",
+           DS4_MODEL_VARIANT == DS4_VARIANT_FLASH ? "flash" :
+           DS4_MODEL_VARIANT == DS4_VARIANT_PRO   ? "pro"   : "glm52");
+    printf("n_layer: %u\n", DS4_N_LAYER);
+    printf("n_embd: %u\n", DS4_N_EMBD);
+    printf("n_vocab: %u\n", DS4_N_VOCAB);
+    printf("n_head: %u\n", DS4_N_HEAD);
+    printf("n_head_kv: %u\n", DS4_N_HEAD_KV);
+    printf("n_head_dim: %u\n", DS4_N_HEAD_DIM);
+    printf("n_value_dim: %u\n", DS4_N_VALUE_DIM);
+    printf("n_rot: %u\n", DS4_N_ROT);
+    printf("n_out_group: %u\n", DS4_N_OUT_GROUP);
+    printf("n_lora_q: %u\n", DS4_N_LORA_Q);
+    printf("n_lora_o: %u\n", DS4_N_LORA_O);
+    printf("n_expert: %u\n", DS4_N_EXPERT);
+    printf("n_expert_used: %u\n", DS4_N_EXPERT_USED);
+    printf("n_expert_shared: %u\n", DS4_N_EXPERT_SHARED);
+    printf("n_ff_exp: %u\n", DS4_N_FF_EXP);
+    printf("n_hash_layer: %u\n", DS4_N_HASH_LAYER);
+    printf("n_swa: %u\n", DS4_N_SWA);
+    printf("n_indexer_head: %u\n", DS4_N_INDEXER_HEAD);
+    printf("n_indexer_head_dim: %u\n", DS4_N_INDEXER_HEAD_DIM);
+    printf("n_indexer_top_k: %u\n", DS4_N_INDEXER_TOP_K);
+    printf("n_hc: %u\n", DS4_N_HC);
+    printf("n_hc_sinkhorn_iter: %u\n", DS4_N_HC_SINKHORN_ITER);
+    printf("n_ff_dense: %u\n", DS4_N_FF_DENSE);
+    printf("n_nextn_predict: %u\n", DS4_N_NEXTN_PREDICT);
+    printf("n_leading_dense: %u\n", DS4_N_LEADING_DENSE);
+    printf("n_kv_lora: %u\n", DS4_N_KV_LORA);
+    printf("n_key_mla: %u\n", DS4_N_KEY_MLA);
+    printf("n_value_mla: %u\n", DS4_N_VALUE_MLA);
+    printf("expert_weight_scale: %.6f\n", (double)DS4_EXPERT_WEIGHT_SCALE);
+    printf("rope_orig_ctx: %llu\n", (unsigned long long)DS4_ROPE_ORIG_CTX);
 }
 
 int ds4_engine_vocab_size(ds4_engine *e) {
