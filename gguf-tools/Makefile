@@ -43,10 +43,13 @@ CPPFLAGS ?= -D_GNU_SOURCE
 
 .PHONY: all clean quality-score quality-llama-score
 
-all: deepseek4-quantize
+all: deepseek4-quantize deepseek4-shrink
 
 deepseek4-quantize: deepseek4-quantize.c quants.c quants.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -o $@ deepseek4-quantize.c quants.c -lm -pthread
+
+deepseek4-shrink: deepseek4-shrink.c quants.c quants.h iq2xxs_tables.inc
+	$(CC) $(CFLAGS) $(CPPFLAGS) -o $@ deepseek4-shrink.c quants.c -lm -pthread
 
 quality-score:
 	$(MAKE) -C .. $(QUALITY_TARGETS)
