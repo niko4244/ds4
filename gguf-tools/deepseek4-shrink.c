@@ -129,6 +129,7 @@ typedef struct {
     size_t kv_raw_len;
     size_t alignment;
     int n_experts; /* deepseek4.expert_count, -1 if absent */
+    int n_ff_exp;  /* deepseek4.expert_feed_forward_length, -1 if absent */
     size_t data_offset;
     tensor_meta *tensors;
 } gguf_file;
@@ -210,6 +211,88 @@ static size_t gguf_string_size(const char *s) {
     return sizeof(uint64_t) + strlen(s);
 }
 
+/* Rewrite a UINT32 KV value in the raw KV byte blob in place.  The value is
+ * the same size as before, so no record or file offsets shift.  Returns the
+ * new value on success, or -1 if the key is absent or not a UINT32. */
+static int64_t kv_patch_u32(uint8_t *kv, size_t kv_len, const char *key, uint32_t value) {
+    size_t p = 0;
+    while (p < kv_len) {
+        if (kv_len - p < 8) return -1;
+        uint64_t klen = 0;
+        for (int b = 0; b < 8; b++) klen |= (uint64_t)kv[p + b] << (8 * b);
+        p += 8;
+        if (klen > kv_len - p) return -1;
+        char *k = xmalloc((size_t)klen + 1);
+        memcpy(k, kv + p, (size_t)klen);
+        k[klen] = '\0';
+        p += (size_t)klen;
+        if (kv_len - p < 4) { free(k); return -1; }
+        uint32_t type = 0;
+        for (int b = 0; b < 4; b++) type |= (uint32_t)kv[p + b] << (8 * b);
+        p += 4;
+        if (strcmp(k, key) == 0) {
+            if (type != GGUF_TYPE_UINT32) { free(k); return -1; }
+            if (kv_len - p < 4) { free(k); return -1; }
+            for (int b = 0; b < 4; b++) kv[p + b] = (uint8_t)((value >> (8 * b)) & 0xff);
+            free(k);
+            return (int64_t)value;
+        }
+        free(k);
+        /* skip value by type (arrays included: tokenizer KVs precede the
+         * FFN-width key and must be walked, not rejected) */
+        size_t vsz = 0;
+        switch (type) {
+            case GGUF_TYPE_UINT8: case GGUF_TYPE_INT8: case GGUF_TYPE_BOOL: vsz = 1; break;
+            case GGUF_TYPE_UINT16: case GGUF_TYPE_INT16: vsz = 2; break;
+            case GGUF_TYPE_UINT32: case GGUF_TYPE_INT32: case GGUF_TYPE_FLOAT32: vsz = 4; break;
+            case GGUF_TYPE_UINT64: case GGUF_TYPE_INT64: case GGUF_TYPE_FLOAT64: vsz = 8; break;
+            case GGUF_TYPE_STRING: {
+                if (kv_len - p < 8) return -1;
+                uint64_t slen = 0;
+                for (int b = 0; b < 8; b++) slen |= (uint64_t)kv[p + b] << (8 * b);
+                p += 8;
+                vsz = (size_t)slen;
+                break;
+            }
+            case GGUF_TYPE_ARRAY: {
+                if (kv_len - p < 12) return -1;
+                uint32_t et = 0;
+                for (int b = 0; b < 4; b++) et |= (uint32_t)kv[p + b] << (8 * b);
+                uint64_t n = 0;
+                for (int b = 0; b < 8; b++) n |= (uint64_t)kv[p + 4 + b] << (8 * b);
+                p += 12;
+                if (et == GGUF_TYPE_STRING) {
+                    for (uint64_t i = 0; i < n; i++) {
+                        if (kv_len - p < 8) return -1;
+                        uint64_t slen = 0;
+                        for (int b = 0; b < 8; b++) slen |= (uint64_t)kv[p + b] << (8 * b);
+                        p += 8;
+                        if (slen > kv_len - p) return -1;
+                        p += (size_t)slen;
+                    }
+                } else {
+                    size_t esz = 0;
+                    switch (et) {
+                        case GGUF_TYPE_UINT8: case GGUF_TYPE_INT8: case GGUF_TYPE_BOOL: esz = 1; break;
+                        case GGUF_TYPE_UINT16: case GGUF_TYPE_INT16: esz = 2; break;
+                        case GGUF_TYPE_UINT32: case GGUF_TYPE_INT32: case GGUF_TYPE_FLOAT32: esz = 4; break;
+                        case GGUF_TYPE_UINT64: case GGUF_TYPE_INT64: case GGUF_TYPE_FLOAT64: esz = 8; break;
+                        default: return -1;
+                    }
+                    if (n > (kv_len - p) / esz) return -1;
+                    p += (size_t)n * esz;
+                }
+                vsz = 0;
+                break;
+            }
+            default: return -1;
+        }
+        if (vsz > kv_len - p) return -1;
+        p += vsz;
+    }
+    return -1;
+}
+
 static bool is_imatrix_kv_key(const char *key) {
     return str_starts(key, "quantize.imatrix.");
 }
@@ -257,6 +340,7 @@ static gguf_file load_gguf_metadata(const char *path) {
     gguf_file g = {0};
     g.path = xstrdup(path);
     g.n_experts = -1;
+    g.n_ff_exp = -1;
     FILE *fp = fopen(path, "rb");
     if (!fp) die_errno("open GGUF", path);
     char magic[4];
@@ -287,6 +371,14 @@ static gguf_file load_gguf_metadata(const char *path) {
             } else if (type == GGUF_TYPE_UINT64) {
                 uint64_t n = read_u64_le_fp(fp, "GGUF expert count");
                 if (n <= (uint64_t)INT_MAX) g.n_experts = (int)n;
+            } else {
+                skip_gguf_value_fp(fp, type);
+            }
+        } else if (strcmp(key, "deepseek4.expert_feed_forward_length") == 0 ||
+                   strcmp(key, "glm-dsa.expert_feed_forward_length") == 0) {
+            if (type == GGUF_TYPE_UINT32) {
+                uint32_t n = read_u32_le_fp(fp, "GGUF expert FFN length");
+                if (n <= (uint32_t)INT_MAX) g.n_ff_exp = (int)n;
             } else {
                 skip_gguf_value_fp(fp, type);
             }
@@ -648,6 +740,7 @@ typedef struct {
     bool is_expert;
     int layer; /* -1 if none */
     bool is_mtp;
+    bool is_shared; /* dense shared expert (ffn_*_shexp), rank-2 */
     int part; /* 0 gate, 1 down, 2 up */
 } expert_tensor;
 
@@ -665,10 +758,31 @@ static expert_tensor parse_expert_tensor(const char *name) {
         }
         return out;
     }
+    if (sscanf(name, "blk.%d.ffn_%15[^_]_shexp.weight%n", &layer, kind, &rest) == 2
+        && rest == (int)strlen(name)) {
+        out.layer = layer;
+        out.is_shared = true;
+        if (strcmp(kind, "gate") == 0 || strcmp(kind, "down") == 0 || strcmp(kind, "up") == 0) {
+            out.is_expert = true;
+            out.part = strcmp(kind, "gate") == 0 ? 0 : strcmp(kind, "down") == 0 ? 1 : 2;
+        }
+        return out;
+    }
     if (sscanf(name, "mtp.%d.ffn_%15[^_]_exps.weight%n", &layer, kind, &rest) == 2
         && rest == (int)strlen(name)) {
         out.layer = layer;
         out.is_mtp = true;
+        if (strcmp(kind, "gate") == 0 || strcmp(kind, "down") == 0 || strcmp(kind, "up") == 0) {
+            out.is_expert = true;
+            out.part = strcmp(kind, "gate") == 0 ? 0 : strcmp(kind, "down") == 0 ? 1 : 2;
+        }
+        return out;
+    }
+    if (sscanf(name, "mtp.%d.ffn_%15[^_]_shexp.weight%n", &layer, kind, &rest) == 2
+        && rest == (int)strlen(name)) {
+        out.layer = layer;
+        out.is_mtp = true;
+        out.is_shared = true;
         if (strcmp(kind, "gate") == 0 || strcmp(kind, "down") == 0 || strcmp(kind, "up") == 0) {
             out.is_expert = true;
             out.part = strcmp(kind, "gate") == 0 ? 0 : strcmp(kind, "down") == 0 ? 1 : 2;
@@ -686,7 +800,8 @@ typedef struct {
     int64_t cols_dst;   /* emitted row width (ne[0] after plan mutation) */
     int64_t rows_keep;  /* rows emitted per expert (ne[1] after plan mutation) */
     int64_t src_rows;   /* source rows per expert */
-    int n_experts;      /* ne[2] */
+    int n_experts;      /* ne[2], or 1 for rank-2 shared experts */
+    bool is_shared;     /* rank-2 dense shared expert (no per-expert stride) */
     bool imatrix_strict;
     const imatrix_store *imatrix;
     uint8_t *out;       /* rows_keep * n_experts rows, contiguous per expert */
@@ -712,8 +827,10 @@ static void shrink_one_expert(shrink_job *j, int xid) {
 
     /* read + dequant the source rows [0, rows_keep) of this expert.  For a
      * column-shrunk tensor (down) only the first cols_dst elements of each
-     * source row are decoded; dequantize_row() decodes a prefix by count. */
-    const size_t src_off = (size_t)xid * (size_t)j->src_rows * row_bytes_full;
+     * source row are decoded; dequantize_row() decodes a prefix by count.
+     * Rank-2 shared experts are a single dense tensor: xid is always 0 and
+     * there is no per-expert stride. */
+    const size_t src_off = j->is_shared ? 0 : (size_t)xid * (size_t)j->src_rows * row_bytes_full;
     float *f32 = xmalloc((size_t)j->rows_keep * row_elems * sizeof(float));
     uint8_t *rowbuf = xmalloc(row_bytes_full);
     FILE *fp = fopen(j->in->path, "rb");
@@ -785,8 +902,12 @@ static uint8_t *shrink_expert_tensor(const gguf_file *in, int idx, int64_t divid
                                      int n_threads, const imatrix_store *imatrix,
                                      bool imatrix_strict) {
     const tensor_meta *t = &in->tensors[idx];
-    if (t->n_dims != 3) {
-        fprintf(stderr, "deepseek4-shrink: %s has rank %d, expected 3\n", t->name, t->n_dims);
+    expert_tensor e = parse_expert_tensor(t->name);
+    const bool is_shared = e.is_shared;
+    const int ndim_ok = is_shared ? 2 : 3;
+    if (t->n_dims != ndim_ok) {
+        fprintf(stderr, "deepseek4-shrink: %s has rank %d, expected %d\n",
+                t->name, t->n_dims, ndim_ok);
         exit(1);
     }
     if (t->ne[0] % ds4q_block_size(t->type) != 0) {
@@ -794,21 +915,22 @@ static uint8_t *shrink_expert_tensor(const gguf_file *in, int idx, int64_t divid
                 t->name, t->ne[0], ds4q_type_name(t->type));
         exit(1);
     }
-    if (in->n_experts > 0 && t->ne[2] != in->n_experts) {
+    if (!is_shared && in->n_experts > 0 && t->ne[2] != in->n_experts) {
         fprintf(stderr, "deepseek4-shrink: %s: ne[2]=%" PRId64 " but expert_count=%d\n",
                 t->name, t->ne[2], in->n_experts);
         exit(1);
     }
     /* the caller's plan already divided the sliced dim (rows for gate/up,
      * columns for down); the source tensor still has divide times more
-     * elements along that dim per expert */
-    expert_tensor e = parse_expert_tensor(t->name);
+     * elements along that dim per expert.  Shared experts are rank-2 dense
+     * tensors with the same part-aware slicing (gate/up row-slice, down
+     * column-slice) and are treated as a single logical expert. */
     const bool slice_rows = e.part != 1; /* down (part 1) is [hidden, embd]: slice columns */
     const int64_t rows_keep = t->ne[1];          /* rows emitted per expert */
     const int64_t cols_dst = t->ne[0];           /* emitted row width */
     const int64_t cols_full = slice_rows ? cols_dst : cols_dst * divide;
     const int64_t src_rows = slice_rows ? rows_keep * divide : rows_keep;
-    const int64_t n_experts = t->ne[2];
+    const int64_t n_experts = is_shared ? 1 : t->ne[2];
     const size_t per_expert = (size_t)rows_keep * ds4q_row_size(t->type, cols_dst);
     uint8_t *out = xcalloc((size_t)n_experts, per_expert);
     ds4q_quantize_init(t->type);
@@ -816,7 +938,8 @@ static uint8_t *shrink_expert_tensor(const gguf_file *in, int idx, int64_t divid
         .in = in, .tensor_idx = idx, .t = t,
         .cols_full = cols_full, .cols_dst = cols_dst,
         .rows_keep = rows_keep, .src_rows = src_rows,
-        .n_experts = (int)n_experts, .imatrix_strict = imatrix_strict,
+        .n_experts = (int)n_experts, .is_shared = is_shared,
+        .imatrix_strict = imatrix_strict,
         .imatrix = imatrix, .out = out, .next = 0, .done = 0,
     };
     pthread_mutex_init(&job.lock, NULL);
@@ -941,7 +1064,8 @@ static void print_plan(const gguf_file *in, int64_t divide, const bool *layer_se
             /* down (part==1) is [hidden, embd]: slice columns; gate/up slice rows */
             int64_t n0 = t->ne[0], n1 = t->ne[1];
             if (e.part == 1) n0 = t->ne[0] / divide; else n1 = t->ne[1] / divide;
-            size_t out_sz = ds4q_row_size(t->type, n0) * (size_t)n1 * (size_t)t->ne[2];
+            const size_t n_exps = e.is_shared ? 1 : (size_t)t->ne[2];
+            size_t out_sz = ds4q_row_size(t->type, n0) * (size_t)n1 * n_exps;
             out_total += out_sz;
             n_shrunk++;
             printf("shrink: %-52s %s %" PRId64 "x%" PRId64 "x%" PRId64 " -> %" PRId64 "x%" PRId64 "x%" PRId64 " (%zu MiB)\n",
@@ -977,8 +1101,10 @@ static void validate_tensor(const gguf_file *in, const gguf_file *out, const cha
          * down shrinks ne[0], gate/up shrink ne[1]) */
         const int64_t ncols = o->ne[0] < t->ne[0] ? o->ne[0] : t->ne[0];
         const int64_t keep = o->ne[1] < t->ne[1] ? o->ne[1] : t->ne[1];
-        const size_t src_row_bytes = t->size / (size_t)t->ne[1] / (size_t)t->ne[2];
-        const size_t out_row_bytes = o->size / (size_t)o->ne[1] / (size_t)o->ne[2];
+        /* row bytes are a function of the quant type and row width; the
+         * size/dims ratio would divide by ne[2]=0 for rank-2 shared experts */
+        const size_t src_row_bytes = ds4q_row_size(t->type, (int64_t)t->ne[0]);
+        const size_t out_row_bytes = ds4q_row_size(o->type, (int64_t)o->ne[0]);
         double mean_err = 0, mean_abs_x = 0, max_err = 0, max_abs_x = 0;
         double n = 0;
         uint8_t *rb = xmalloc(src_row_bytes);
@@ -988,12 +1114,15 @@ static void validate_tensor(const gguf_file *in, const gguf_file *out, const cha
         FILE *fin = fopen(in->path, "rb");
         FILE *fout = fopen(out->path, "rb");
         if (!fin || !fout) die("open failure during validate");
-        for (int xid = 0; xid < (int)t->ne[2]; xid++) {
+        const int n_x = e.is_shared ? 1 : (int)t->ne[2];
+        for (int xid = 0; xid < n_x; xid++) {
+            const size_t xstride = e.is_shared ? 0 : (size_t)xid * (size_t)t->ne[1] * src_row_bytes;
             for (int64_t r = 0; r < keep; r++) {
                 size_t off_in = in->data_offset + (size_t)t->old_offset +
-                                (size_t)xid * (size_t)t->ne[1] * src_row_bytes + (size_t)r * src_row_bytes;
+                                xstride + (size_t)r * src_row_bytes;
                 size_t off_out = out->data_offset + (size_t)o->old_offset +
-                                 (size_t)xid * (size_t)o->ne[1] * out_row_bytes + (size_t)r * out_row_bytes;
+                                 (e.is_shared ? 0 : (size_t)xid * (size_t)o->ne[1] * out_row_bytes) +
+                                 (size_t)r * out_row_bytes;
                 if (fseeko(fin, (off_t)off_in, SEEK_SET) != 0 || fseeko(fout, (off_t)off_out, SEEK_SET) != 0) die("validate seek");
                 if (fread(rb, 1, src_row_bytes, fin) != src_row_bytes) die("validate read in");
                 if (fread(ro, 1, out_row_bytes, fout) != out_row_bytes) die("validate read out");
@@ -1157,6 +1286,24 @@ int main(int argc, char **argv) {
             off += ds4q_pad(t->size, in.alignment);
         }
     }
+    /* The routed-expert FFN width is stored in GGUF metadata as
+     * deepseek4.expert_feed_forward_length.  A width-shrunk model must carry
+     * the shrunk value (source / divide) so ds4 selects the right shape and
+     * sizes the routed-FFN kernels; rewrite it in place (same-size u32). */
+    {
+        const char *ffn_key = "deepseek4.expert_feed_forward_length";
+        int64_t patched = kv_patch_u32(in.kv_raw, in.kv_raw_len, ffn_key,
+                                       (uint32_t)(in.n_ff_exp > 0 ? in.n_ff_exp / (uint32_t)divide : 0));
+        if (patched >= 0) {
+            fprintf(stderr, "patched %s -> %" PRId64 "\n", ffn_key, patched);
+        } else {
+            /* GLM-family models use glm-dsa.expert_feed_forward_length */
+            patched = kv_patch_u32(in.kv_raw, in.kv_raw_len, "glm-dsa.expert_feed_forward_length",
+                                   (uint32_t)(in.n_ff_exp > 0 ? in.n_ff_exp / (uint32_t)divide : 0));
+            if (patched >= 0) fprintf(stderr, "patched glm-dsa.expert_feed_forward_length -> %" PRId64 "\n", patched);
+        }
+    }
+
     size_t tensor_info = 0;
     uint64_t n_emit = 0;
     for (uint64_t i = 0; i < in.n_tensors; i++) {

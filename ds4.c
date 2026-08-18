@@ -5449,6 +5449,7 @@ static bool ds4_shape_matches_metadata_base(
         uint32_t n_indexer_top_k,
         uint32_t n_hc,
         uint32_t n_hc_sinkhorn_iter) {
+    (void)n_ff_exp; /* FFN width is metadata-driven (width-shrunk variants) */
     return s->n_layer == n_layer &&
            s->n_embd == n_embd &&
            s->n_vocab == n_vocab &&
@@ -5461,7 +5462,6 @@ static bool ds4_shape_matches_metadata_base(
            s->n_lora_o == n_lora_o &&
            s->n_out_group == n_out_group &&
            s->n_expert_used == n_expert_used &&
-           s->n_ff_exp == n_ff_exp &&
            s->n_expert_shared == n_expert_shared &&
            s->n_hash_layer == n_hash_layer &&
            s->n_swa == n_swa &&
@@ -5539,6 +5539,17 @@ static void ds4_select_shape_from_metadata(
                                           "DeepSeek V4 Flash REAP-144");
         } else {
             ds4_shape_select_with_experts(&DS4_SHAPE_FLASH, n_expert, NULL);
+        }
+        /* The routed-expert FFN width is metadata-driven: a width-shrunk
+         * variant (e.g. D144W4 halves/quarters the hidden dim) overrides the
+         * base shape so buffers, tensor validation, and the routed-FFN
+         * kernels all consume the declared width. */
+        if (n_ff_exp != 0 && n_ff_exp != g_ds4_shape.n_ff_exp) {
+            fprintf(stderr,
+                    "ds4: %s: expert_feed_forward_length=%u (base %u); "
+                    "routed-FFN kernels will use the metadata width\n",
+                    g_ds4_shape.name, n_ff_exp, g_ds4_shape.n_ff_exp);
+            g_ds4_shape.n_ff_exp = n_ff_exp;
         }
         return;
     }
@@ -5732,7 +5743,9 @@ static void config_validate_deepseek4_model(const ds4_model *m) {
     config_expect_u32("attention.output_lora_rank",  n_lora_o,        DS4_N_LORA_O);
     config_expect_u32("expert_count",               n_expert,        DS4_N_EXPERT);
     config_expect_u32("expert_used_count",          n_expert_used,   DS4_N_EXPERT_USED);
-    config_expect_u32("expert_feed_forward_length", n_ff_exp,        DS4_N_FF_EXP);
+    /* expert_feed_forward_length is intentionally NOT hard-gated: the shape
+     * matcher stamps the metadata value (width-shrunk variants like D144W4
+     * are valid), so a plain equality check here would be redundant. */
     config_expect_u32("expert_shared_count",         n_expert_shared, DS4_N_EXPERT_SHARED);
     config_expect_u32("hash_layer_count",            n_hash_layer,    DS4_N_HASH_LAYER);
     config_expect_u32("expert_group_count",         n_expert_groups, 0);
