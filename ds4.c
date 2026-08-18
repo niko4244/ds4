@@ -56207,6 +56207,24 @@ static bool engine_deepseek_routed_expert_tensor(
     return true;
 }
 
+/* Name-based routed-expert detection. The pointer-compare in
+ * engine_deepseek_routed_expert_tensor depends on weights-layer aliasing
+ * into the model tensor table, which is not guaranteed on every bind path;
+ * the GGUF tensor name is unambiguous for the three routed expert tensors. */
+static bool engine_tensor_is_routed_expert_name(const ds4_tensor *t) {
+    if (!t || !t->name.ptr || t->name.len < 16) return false;
+    const char *n = t->name.ptr;
+    const size_t len = (size_t)t->name.len;
+    static const char *const sfx[3] = {
+        ".ffn_gate_exps.weight", ".ffn_up_exps.weight", ".ffn_down_exps.weight"
+    };
+    for (int i = 0; i < 3; i++) {
+        const size_t sl = strlen(sfx[i]);
+        if (len >= sl && memcmp(n + len - sl, sfx[i], sl) == 0) return true;
+    }
+    return false;
+}
+
 static bool engine_cuda_tp_decode_requested(const ds4_engine *e);
 static bool engine_cuda_tp_ep_requested(const ds4_engine *e);
 static bool engine_cuda_tp_output_env_requested(void);
@@ -56230,6 +56248,15 @@ static int engine_compute_entry_bytes(const ds4_engine *e, size_t *out) {
             /* Output TP stores one vocabulary-row slice per participating
              * tier. Those bytes are reserved per tier after the head tier is
              * known, rather than charging a full output matrix here. */
+            continue;
+        }
+        /* SSD streaming loads routed experts on demand from the host mmap, so
+         * they are not resident and must not count against the packer's
+         * per-device budget. Counting them makes an oversubscribed teacher
+         * (e.g. REAP at 52.6 GB) spill every layer to CPU, which in turn trips
+         * the --ssd-streaming "not compatible with multi-GPU placement"
+         * rejection even though the streaming path is single-tier capable. */
+        if (e->ssd_streaming && engine_tensor_is_routed_expert_name(t)) {
             continue;
         }
         uint64_t expert_bytes = 0;
@@ -56719,6 +56746,12 @@ static int engine_install_per_device_caches(ds4_engine *e) {
         if (t->bytes == 0) continue;
         int entry = tensor_to_entry(t, DS4_N_LAYER);
         if (entry < 0 || entry >= e->n_placement_entries) entry = 0;
+        if (e->ssd_streaming && entry >= 1 && entry <= (int)DS4_N_LAYER &&
+            engine_tensor_is_routed_expert_name(t)) {
+            /* Routed experts stream on demand; they are not part of the
+             * resident per-device selective cache. */
+            continue;
+        }
         int logical_tier = e->placement[entry];
         if (logical_tier == DS4_LAYER_PACK_CPU) continue;        /* CPU spill: skip here. */
         if (logical_tier < 0 || logical_tier >= e->gpu_cfg.n_gpus) {
