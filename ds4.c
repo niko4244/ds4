@@ -16384,6 +16384,149 @@ static void metal_graph_debug_dump_i32_tensor(
     }
 }
 
+/* =========================================================================
+ * Distillation teacher logit dump (DS4_DISTILL_LOGIT_DUMP).
+ * =========================================================================
+ * When DS4_DISTILL_LOGIT_DUMP=<dir> is set, decode appends two binary
+ * streams under <dir> so REAP can act as a distillation teacher:
+ *
+ *   <dir>/router.bin     - per (layer, position): raw gate-in router logits,
+ *                          sqrt-softplus router probs, top-k router weights,
+ *                          and the selected expert ids (written as f32).
+ *   <dir>/routed_ffn.bin - per (layer, position): the routed-FFN output
+ *                          vector (per-layer MoE contribution).
+ *
+ * Record layout (little-endian; 32-byte header, then payload):
+ *   u32 magic   = 0x4453494C ("DSIL")
+ *   u32 version = 1
+ *   u32 kind    = 0 (router) | 1 (routed_ffn)
+ *   u32 il      = layer index
+ *   u32 pos     = sequence position
+ *   u32 token   = token id
+ *   u32 n       = payload float count
+ *   u32 reserved= 0
+ *   f32 payload[n]
+ *
+ * kind=0 payload: [logits(N_E) | probs(N_E) | weights(K) | selected(K)],
+ *                 where N_E = n - 2*K and K = DS4_N_EXPERT_USED.
+ * kind=1 payload: [routed_ffn(N_EMBD)].
+ *
+ * Router records require the CPU router path
+ * (DS4_METAL_ENABLE_STREAMING_IQ2_CPU_ROUTER=1), where the gate-in logits
+ * are already resident in host memory.  Routed-FFN records are emitted in
+ * every single-token decode path.  This dump emits only the teacher's own
+ * activations for the tokens it decodes; the corpus is controlled upstream
+ * (no eval-data leakage here).
+ * =========================================================================
+ */
+typedef struct {
+    int init;
+    int enabled;
+    char dir[1024];
+    FILE *router_fp;
+    FILE *ffn_fp;
+} distill_dump_state;
+
+static distill_dump_state g_distill_dump;
+
+static void distill_dump_init(void) {
+    if (g_distill_dump.init) return;
+    g_distill_dump.init = 1;
+    const char *dir = getenv("DS4_DISTILL_LOGIT_DUMP");
+    if (!dir || !dir[0]) return;
+    if (strlen(dir) >= sizeof(g_distill_dump.dir)) {
+        fprintf(stderr, "ds4: distill dump: path too long: %s\n", dir);
+        return;
+    }
+    memcpy(g_distill_dump.dir, dir, strlen(dir) + 1);
+    if (mkdir(g_distill_dump.dir, 0755) != 0 && errno != EEXIST) {
+        fprintf(stderr, "ds4: distill dump: mkdir %s failed: %s\n",
+                g_distill_dump.dir, strerror(errno));
+        return;
+    }
+    g_distill_dump.enabled = 1;
+    fprintf(stderr, "ds4: distill logit dump enabled -> %s\n", g_distill_dump.dir);
+}
+
+static bool distill_dump_enabled(void) {
+    distill_dump_init();
+    return g_distill_dump.enabled != 0;
+}
+
+static FILE *distill_dump_stream(FILE **fp, const char *name) {
+    if (*fp) return *fp;
+    char path[1280];
+    snprintf(path, sizeof(path), "%s/%s", g_distill_dump.dir, name);
+    *fp = fopen(path, "ab");
+    if (!*fp) {
+        fprintf(stderr, "ds4: distill dump: failed to open %s: %s\n",
+                path, strerror(errno));
+    }
+    return *fp;
+}
+
+static bool distill_dump_record(
+        uint32_t       kind,
+        uint32_t       il,
+        uint32_t       pos,
+        uint32_t       token,
+        const float   *payload,
+        uint32_t       n) {
+    FILE *fp = distill_dump_stream(
+        kind == 0 ? &g_distill_dump.router_fp : &g_distill_dump.ffn_fp,
+        kind == 0 ? "router.bin" : "routed_ffn.bin");
+    if (!fp) return false;
+    uint32_t hdr[8];
+    hdr[0] = 0x4453494Cu; /* "DSIL" */
+    hdr[1] = 1u;
+    hdr[2] = kind;
+    hdr[3] = il;
+    hdr[4] = pos;
+    hdr[5] = token;
+    hdr[6] = n;
+    hdr[7] = 0u;
+    if (fwrite(hdr, sizeof(hdr[0]), 8, fp) != 8) return false;
+    if (n != 0 && fwrite(payload, sizeof(payload[0]), (size_t)n, fp) != (size_t)n) return false;
+    return fflush(fp) == 0;
+}
+
+static void distill_dump_router(
+        uint32_t      il,
+        uint32_t      pos,
+        uint32_t      token,
+        const float  *logits,
+        const float  *probs,
+        const float  *weights,
+        const int    *selected) {
+    float payload[DS4_MAX_EXPERT * 2 + DS4_MAX_EXPERT_USED * 2];
+    uint32_t off = 0;
+    for (uint32_t i = 0; i < (uint32_t)DS4_N_EXPERT; i++) payload[off++] = logits[i];
+    for (uint32_t i = 0; i < (uint32_t)DS4_N_EXPERT; i++) payload[off++] = probs[i];
+    for (uint32_t i = 0; i < (uint32_t)DS4_N_EXPERT_USED; i++) payload[off++] = weights[i];
+    for (uint32_t i = 0; i < (uint32_t)DS4_N_EXPERT_USED; i++) payload[off++] = (float)selected[i];
+    distill_dump_record(0, il, pos, token, payload, off);
+}
+
+static void distill_dump_ffn(
+        ds4_gpu_tensor *t,
+        uint32_t        il,
+        uint32_t        pos,
+        uint32_t        token) {
+    if (!t || !distill_dump_enabled()) return;
+    if (ds4_gpu_synchronize() == 0) {
+        fprintf(stderr, "ds4: distill dump: failed to synchronize before routed_ffn layer %u pos %u\n", il, pos);
+        return;
+    }
+    float *buf = xmalloc((size_t)DS4_N_EMBD * sizeof(buf[0]));
+    if (ds4_gpu_tensor_read(t, 0, buf, (uint64_t)DS4_N_EMBD * sizeof(buf[0])) != 0) {
+        distill_dump_record(1, il, pos, token, buf, (uint32_t)DS4_N_EMBD);
+    }
+    free(buf);
+    if (ds4_gpu_begin_commands() == 0) {
+        fprintf(stderr, "ds4: distill dump: failed to resume command batch after routed_ffn layer %u pos %u\n", il, pos);
+    }
+}
+
 static bool metal_graph_needs_ffn_out(const ds4_gpu_graph *g, uint32_t il, uint32_t pos) {
     return metal_graph_directional_steering_ffn_enabled(g) ||
            g->materialize_ffn_out ||
@@ -20988,6 +21131,7 @@ static bool metal_graph_decode_cpu_router(
         const ds4_model        *model,
         const ds4_layer_weights *layer,
         uint32_t                il,
+        uint32_t                pos,
         uint32_t                token) {
     const bool profile =
         getenv("DS4_METAL_PRO_Q4_CPU_ROUTER_PROFILE") != NULL ||
@@ -21021,6 +21165,9 @@ static bool metal_graph_decode_cpu_router(
     }
     for (uint32_t i = 0; i < DS4_N_EXPERT_USED; i++) {
         selected_i32[i] = (int32_t)selected[i];
+    }
+    if (distill_dump_enabled()) {
+        distill_dump_router(il, pos, token, logits, probs, weights, selected);
     }
     const double t_cpu = profile ? now_sec() : 0.0;
 
@@ -23807,7 +23954,7 @@ static bool metal_graph_encode_decode_layer_phase(
     const uint64_t down_row_bytes = routed_expert_row_bytes(layer->ffn_down_exps);
     const uint64_t down_expert_bytes DS4_MAYBE_UNUSED = routed_out_dim * down_row_bytes;
     if (ok && metal_graph_decode_cpu_router_applicable(g, layer)) {
-        ok = metal_graph_decode_cpu_router(g, model, layer, il, (uint32_t)token);
+        ok = metal_graph_decode_cpu_router(g, model, layer, il, pos, (uint32_t)token);
     } else {
         if (ok && !metal_graph_tp_ablate("router")) {
         /* Fused router + shared-expert gate/up: one dispatch instead of two
@@ -24488,6 +24635,7 @@ static bool metal_graph_encode_decode_layer_phase(
             metal_graph_debug_dump_tensor("ffn_moe_down", metal_graph_routed_down(g),
                                           (uint64_t)DS4_N_EXPERT_USED * DS4_N_EMBD, il, pos);
             metal_graph_debug_dump_tensor("ffn_moe_out", metal_graph_routed_out(g), DS4_N_EMBD, il, pos);
+            distill_dump_ffn(metal_graph_routed_out(g), il, pos, (uint32_t)token);
         }
         if (ok && fuse_shared_down_hc) {
             ok = ds4_gpu_shared_down_hc_expand_q8_0_tensor(metal_graph_after_ffn_hc(g),
@@ -24694,6 +24842,7 @@ static bool metal_graph_encode_decode_layer_phase(
             metal_graph_debug_dump_tensor("ffn_moe_down", metal_graph_routed_down(g),
                                           (uint64_t)DS4_N_EXPERT_USED * DS4_N_EMBD, il, pos);
             metal_graph_debug_dump_tensor("ffn_moe_out", metal_graph_routed_out(g), DS4_N_EMBD, il, pos);
+            distill_dump_ffn(metal_graph_routed_out(g), il, pos, (uint32_t)token);
         }
         if (ok && fuse_shared_down_hc) {
             ok = ds4_gpu_shared_down_hc_expand_q8_0_tensor(metal_graph_after_ffn_hc(g),
@@ -24822,6 +24971,7 @@ static bool metal_graph_encode_decode_layer_phase(
     }
     if (ok) {
         metal_graph_debug_dump_tensor("ffn_moe_out", metal_graph_routed_out(g), DS4_N_EMBD, il, pos);
+        distill_dump_ffn(metal_graph_routed_out(g), il, pos, (uint32_t)token);
     }
     if (phase == METAL_DECODE_LAYER_TO_SHARED_MID ||
         phase == METAL_DECODE_LAYER_FROM_QA_KV_RAW_TO_SHARED_MID) {
