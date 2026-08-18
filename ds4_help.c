@@ -268,6 +268,7 @@ static void print_cli_specific(FILE *fp, const help_colors *c, bool full) {
 static void print_cli_diagnostics(FILE *fp, const help_colors *c) {
     title(fp, c, "Diagnostics And Data Collection");
     opt(fp, c, "--inspect", "Load the model and print a summary only.");
+    opt(fp, c, "--shape-dump", "Load the model and print the resolved shape (architecture + expert count) only.");
     opt(fp, c, "--dump-tokens", "Tokenize the prompt exactly as written, then exit.");
     opt(fp, c, "--dump-logits FILE", "Write full next-token logits as JSON.");
     opt(fp, c, "--dump-logprobs FILE", "Write greedy continuation top-logprobs as JSON.");

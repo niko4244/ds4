@@ -95,6 +95,7 @@ typedef struct {
     cli_generation_options gen;
     char *prompt_owned;
     bool inspect;
+    bool shape_dump;
     /* CLI flag wiring: raw argv values for --gpu-vram and --gpu-devices.
      * Resolved post-parse via parse_gpu_vram_arg(). */
     const char *gpu_vram_arg;
@@ -2009,6 +2010,8 @@ static cli_config parse_options(int argc, char **argv) {
             exit(2);
         } else if (!strcmp(arg, "--inspect")) {
             c.inspect = true;
+        } else if (!strcmp(arg, "--shape-dump")) {
+            c.shape_dump = true;
         } else if (!strcmp(arg, "--warm-weights")) {
             c.engine.warm_weights = true;
         } else if (!strcmp(arg, "--server")) {
@@ -2070,7 +2073,7 @@ int main(int argc, char **argv) {
         free(cfg.prompt_owned);
         return rc;
     }
-    cfg.engine.inspect_only = cfg.inspect;
+    cfg.engine.inspect_only = cfg.inspect || cfg.shape_dump;
     cfg.engine.first_token_test = cfg.gen.first_token_test;
     cfg.engine.metal_graph_test = cfg.gen.metal_graph_test;
     cfg.engine.context_size = cfg.gen.ctx_size;
@@ -2172,7 +2175,7 @@ int main(int argc, char **argv) {
         free(cfg.prompt_owned);
         return rc;
     }
-    if (!cfg.inspect) {
+    if (!cfg.inspect && !cfg.shape_dump) {
         log_context_memory(cfg.engine.backend,
                            cfg.gen.ctx_size,
                            ds4_engine_prefill_chunk(engine),
@@ -2180,7 +2183,9 @@ int main(int argc, char **argv) {
         cli_warn_think_max_downgraded(&cfg.gen, "--think-max");
     }
     int rc = 0;
-    if (cfg.inspect) {
+    if (cfg.shape_dump) {
+        ds4_engine_shape_dump(engine);
+    } else if (cfg.inspect) {
         ds4_engine_summary(engine);
     } else if (cfg.gen.imatrix_output_path) {
         rc = ds4_engine_collect_imatrix(engine,

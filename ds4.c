@@ -576,6 +576,13 @@ static const ds4_shape DS4_SHAPE_FLASH = {
     .rope_orig_ctx = DS4_DEFAULT_ROPE_ORIG_CTX,
 };
 
+/* REAP-pruned Flash checkpoints (Cerebras REAP one-shot expert pruning,
+ * e.g. 0xSero/DeepSeek-V4-Flash-162B keeps K=144 of 256 experts) are NOT
+ * listed as separate shapes: pruning changes only the routed-expert count
+ * and leaves every other dimension identical, so ds4_select_shape_from_
+ * metadata() matches the base Flash architecture ignoring n_expert and
+ * overrides it from GGUF metadata. No per-pruning-ratio entry needed. */
+
 static const ds4_shape DS4_SHAPE_PRO = {
     .name = "DeepSeek V4 Pro",
     .family = DS4_MODEL_FAMILY_DEEPSEEK4,
@@ -5419,7 +5426,7 @@ static void dspark_weights_validate_layout(ds4_dspark_weights *dw) {
                                   1, 0);
 }
 
-static bool ds4_shape_matches_metadata(
+static bool ds4_shape_matches_metadata_base(
         const ds4_shape *s,
         uint32_t n_layer,
         uint32_t n_embd,
@@ -5432,7 +5439,6 @@ static bool ds4_shape_matches_metadata(
         uint32_t n_lora_q,
         uint32_t n_lora_o,
         uint32_t n_out_group,
-        uint32_t n_expert,
         uint32_t n_expert_used,
         uint32_t n_ff_exp,
         uint32_t n_expert_shared,
@@ -5443,6 +5449,7 @@ static bool ds4_shape_matches_metadata(
         uint32_t n_indexer_top_k,
         uint32_t n_hc,
         uint32_t n_hc_sinkhorn_iter) {
+    (void)n_ff_exp; /* FFN width is metadata-driven (width-shrunk variants) */
     return s->n_layer == n_layer &&
            s->n_embd == n_embd &&
            s->n_vocab == n_vocab &&
@@ -5454,9 +5461,7 @@ static bool ds4_shape_matches_metadata(
            s->n_lora_q == n_lora_q &&
            s->n_lora_o == n_lora_o &&
            s->n_out_group == n_out_group &&
-           s->n_expert == n_expert &&
            s->n_expert_used == n_expert_used &&
-           s->n_ff_exp == n_ff_exp &&
            s->n_expert_shared == n_expert_shared &&
            s->n_hash_layer == n_hash_layer &&
            s->n_swa == n_swa &&
@@ -5465,6 +5470,30 @@ static bool ds4_shape_matches_metadata(
            s->n_indexer_top_k == n_indexer_top_k &&
            s->n_hc == n_hc &&
            s->n_hc_sinkhorn_iter == n_hc_sinkhorn_iter;
+}
+
+/* Buffer for the shape name when the routed-expert count is overridden
+ * from metadata (pruned Flash checkpoints). g_ds4_shape.name is a pointer
+ * into this buffer; a static allocation keeps it valid for the process
+ * lifetime like the other shape name literals. */
+static char g_ds4_shape_name_buf[96];
+
+/* Select a base shape (matched ignoring n_expert), then stamp the routed-
+ * expert count read from GGUF metadata onto it. REAP-144 keeps an explicit
+ * name as the known fallback; any other pruned count is labeled with the
+ * actual expert number so --shape-dump and startup logs stay truthful. */
+static void ds4_shape_select_with_experts(const ds4_shape *base,
+                                          uint32_t n_expert,
+                                          const char *known_name) {
+    g_ds4_shape = *base;
+    g_ds4_shape.n_expert = n_expert;
+    if (known_name) {
+        g_ds4_shape.name = known_name;
+    } else {
+        snprintf(g_ds4_shape_name_buf, sizeof(g_ds4_shape_name_buf),
+                 "%s (%u routed experts)", base->name, n_expert);
+        g_ds4_shape.name = g_ds4_shape_name_buf;
+    }
 }
 
 static void ds4_select_shape_from_metadata(
@@ -5490,25 +5519,50 @@ static void ds4_select_shape_from_metadata(
         uint32_t n_indexer_top_k,
         uint32_t n_hc,
         uint32_t n_hc_sinkhorn_iter) {
-    if (ds4_shape_matches_metadata(&DS4_SHAPE_FLASH,
-                                   n_layer, n_embd, n_vocab, n_head, n_head_kv,
-                                   n_head_dim, n_value_dim, n_rot, n_lora_q,
-                                   n_lora_o, n_out_group, n_expert,
-                                   n_expert_used, n_ff_exp, n_expert_shared,
-                                   n_hash_layer, n_swa, n_indexer_head,
-                                   n_indexer_head_dim, n_indexer_top_k, n_hc,
-                                   n_hc_sinkhorn_iter)) {
-        g_ds4_shape = DS4_SHAPE_FLASH;
+    /* Match the base architecture ignoring n_expert: pruning (REAP and any
+     * future ratio) changes only the routed-expert count, so the base shape
+     * is selected first and n_expert is stamped from the GGUF metadata.
+     * REAP-144 is the known explicit fallback and keeps its name. */
+    if (ds4_shape_matches_metadata_base(&DS4_SHAPE_FLASH,
+                                        n_layer, n_embd, n_vocab, n_head,
+                                        n_head_kv, n_head_dim, n_value_dim,
+                                        n_rot, n_lora_q, n_lora_o, n_out_group,
+                                        n_expert_used, n_ff_exp,
+                                        n_expert_shared, n_hash_layer, n_swa,
+                                        n_indexer_head, n_indexer_head_dim,
+                                        n_indexer_top_k, n_hc,
+                                        n_hc_sinkhorn_iter)) {
+        if (n_expert == DS4_SHAPE_FLASH.n_expert) {
+            g_ds4_shape = DS4_SHAPE_FLASH;
+        } else if (n_expert == 144) {
+            ds4_shape_select_with_experts(&DS4_SHAPE_FLASH, n_expert,
+                                          "DeepSeek V4 Flash REAP-144");
+        } else {
+            ds4_shape_select_with_experts(&DS4_SHAPE_FLASH, n_expert, NULL);
+        }
+        /* The routed-expert FFN width is metadata-driven: a width-shrunk
+         * variant (e.g. D144W4 halves/quarters the hidden dim) overrides the
+         * base shape so buffers, tensor validation, and the routed-FFN
+         * kernels all consume the declared width. */
+        if (n_ff_exp != 0 && n_ff_exp != g_ds4_shape.n_ff_exp) {
+            fprintf(stderr,
+                    "ds4: %s: expert_feed_forward_length=%u (base %u); "
+                    "routed-FFN kernels will use the metadata width\n",
+                    g_ds4_shape.name, n_ff_exp, g_ds4_shape.n_ff_exp);
+            g_ds4_shape.n_ff_exp = n_ff_exp;
+        }
         return;
     }
-    if (ds4_shape_matches_metadata(&DS4_SHAPE_PRO,
-                                   n_layer, n_embd, n_vocab, n_head, n_head_kv,
-                                   n_head_dim, n_value_dim, n_rot, n_lora_q,
-                                   n_lora_o, n_out_group, n_expert,
-                                   n_expert_used, n_ff_exp, n_expert_shared,
-                                   n_hash_layer, n_swa, n_indexer_head,
-                                   n_indexer_head_dim, n_indexer_top_k, n_hc,
-                                   n_hc_sinkhorn_iter)) {
+    if (n_expert == DS4_SHAPE_PRO.n_expert &&
+        ds4_shape_matches_metadata_base(&DS4_SHAPE_PRO,
+                                        n_layer, n_embd, n_vocab, n_head,
+                                        n_head_kv, n_head_dim, n_value_dim,
+                                        n_rot, n_lora_q, n_lora_o, n_out_group,
+                                        n_expert_used, n_ff_exp,
+                                        n_expert_shared, n_hash_layer, n_swa,
+                                        n_indexer_head, n_indexer_head_dim,
+                                        n_indexer_top_k, n_hc,
+                                        n_hc_sinkhorn_iter)) {
         g_ds4_shape = DS4_SHAPE_PRO;
         return;
     }
@@ -5689,7 +5743,9 @@ static void config_validate_deepseek4_model(const ds4_model *m) {
     config_expect_u32("attention.output_lora_rank",  n_lora_o,        DS4_N_LORA_O);
     config_expect_u32("expert_count",               n_expert,        DS4_N_EXPERT);
     config_expect_u32("expert_used_count",          n_expert_used,   DS4_N_EXPERT_USED);
-    config_expect_u32("expert_feed_forward_length", n_ff_exp,        DS4_N_FF_EXP);
+    /* expert_feed_forward_length is intentionally NOT hard-gated: the shape
+     * matcher stamps the metadata value (width-shrunk variants like D144W4
+     * are valid), so a plain equality check here would be redundant. */
     config_expect_u32("expert_shared_count",         n_expert_shared, DS4_N_EXPERT_SHARED);
     config_expect_u32("hash_layer_count",            n_hash_layer,    DS4_N_HASH_LAYER);
     config_expect_u32("expert_group_count",         n_expert_groups, 0);
@@ -16328,6 +16384,149 @@ static void metal_graph_debug_dump_i32_tensor(
     }
 }
 
+/* =========================================================================
+ * Distillation teacher logit dump (DS4_DISTILL_LOGIT_DUMP).
+ * =========================================================================
+ * When DS4_DISTILL_LOGIT_DUMP=<dir> is set, decode appends two binary
+ * streams under <dir> so REAP can act as a distillation teacher:
+ *
+ *   <dir>/router.bin     - per (layer, position): raw gate-in router logits,
+ *                          sqrt-softplus router probs, top-k router weights,
+ *                          and the selected expert ids (written as f32).
+ *   <dir>/routed_ffn.bin - per (layer, position): the routed-FFN output
+ *                          vector (per-layer MoE contribution).
+ *
+ * Record layout (little-endian; 32-byte header, then payload):
+ *   u32 magic   = 0x4453494C ("DSIL")
+ *   u32 version = 1
+ *   u32 kind    = 0 (router) | 1 (routed_ffn)
+ *   u32 il      = layer index
+ *   u32 pos     = sequence position
+ *   u32 token   = token id
+ *   u32 n       = payload float count
+ *   u32 reserved= 0
+ *   f32 payload[n]
+ *
+ * kind=0 payload: [logits(N_E) | probs(N_E) | weights(K) | selected(K)],
+ *                 where N_E = n - 2*K and K = DS4_N_EXPERT_USED.
+ * kind=1 payload: [routed_ffn(N_EMBD)].
+ *
+ * Router records require the CPU router path
+ * (DS4_METAL_ENABLE_STREAMING_IQ2_CPU_ROUTER=1), where the gate-in logits
+ * are already resident in host memory.  Routed-FFN records are emitted in
+ * every single-token decode path.  This dump emits only the teacher's own
+ * activations for the tokens it decodes; the corpus is controlled upstream
+ * (no eval-data leakage here).
+ * =========================================================================
+ */
+typedef struct {
+    int init;
+    int enabled;
+    char dir[1024];
+    FILE *router_fp;
+    FILE *ffn_fp;
+} distill_dump_state;
+
+static distill_dump_state g_distill_dump;
+
+static void distill_dump_init(void) {
+    if (g_distill_dump.init) return;
+    g_distill_dump.init = 1;
+    const char *dir = getenv("DS4_DISTILL_LOGIT_DUMP");
+    if (!dir || !dir[0]) return;
+    if (strlen(dir) >= sizeof(g_distill_dump.dir)) {
+        fprintf(stderr, "ds4: distill dump: path too long: %s\n", dir);
+        return;
+    }
+    memcpy(g_distill_dump.dir, dir, strlen(dir) + 1);
+    if (mkdir(g_distill_dump.dir, 0755) != 0 && errno != EEXIST) {
+        fprintf(stderr, "ds4: distill dump: mkdir %s failed: %s\n",
+                g_distill_dump.dir, strerror(errno));
+        return;
+    }
+    g_distill_dump.enabled = 1;
+    fprintf(stderr, "ds4: distill logit dump enabled -> %s\n", g_distill_dump.dir);
+}
+
+static bool distill_dump_enabled(void) {
+    distill_dump_init();
+    return g_distill_dump.enabled != 0;
+}
+
+static FILE *distill_dump_stream(FILE **fp, const char *name) {
+    if (*fp) return *fp;
+    char path[1280];
+    snprintf(path, sizeof(path), "%s/%s", g_distill_dump.dir, name);
+    *fp = fopen(path, "ab");
+    if (!*fp) {
+        fprintf(stderr, "ds4: distill dump: failed to open %s: %s\n",
+                path, strerror(errno));
+    }
+    return *fp;
+}
+
+static bool distill_dump_record(
+        uint32_t       kind,
+        uint32_t       il,
+        uint32_t       pos,
+        uint32_t       token,
+        const float   *payload,
+        uint32_t       n) {
+    FILE *fp = distill_dump_stream(
+        kind == 0 ? &g_distill_dump.router_fp : &g_distill_dump.ffn_fp,
+        kind == 0 ? "router.bin" : "routed_ffn.bin");
+    if (!fp) return false;
+    uint32_t hdr[8];
+    hdr[0] = 0x4453494Cu; /* "DSIL" */
+    hdr[1] = 1u;
+    hdr[2] = kind;
+    hdr[3] = il;
+    hdr[4] = pos;
+    hdr[5] = token;
+    hdr[6] = n;
+    hdr[7] = 0u;
+    if (fwrite(hdr, sizeof(hdr[0]), 8, fp) != 8) return false;
+    if (n != 0 && fwrite(payload, sizeof(payload[0]), (size_t)n, fp) != (size_t)n) return false;
+    return fflush(fp) == 0;
+}
+
+static void distill_dump_router(
+        uint32_t      il,
+        uint32_t      pos,
+        uint32_t      token,
+        const float  *logits,
+        const float  *probs,
+        const float  *weights,
+        const int    *selected) {
+    float payload[DS4_MAX_EXPERT * 2 + DS4_MAX_EXPERT_USED * 2];
+    uint32_t off = 0;
+    for (uint32_t i = 0; i < (uint32_t)DS4_N_EXPERT; i++) payload[off++] = logits[i];
+    for (uint32_t i = 0; i < (uint32_t)DS4_N_EXPERT; i++) payload[off++] = probs[i];
+    for (uint32_t i = 0; i < (uint32_t)DS4_N_EXPERT_USED; i++) payload[off++] = weights[i];
+    for (uint32_t i = 0; i < (uint32_t)DS4_N_EXPERT_USED; i++) payload[off++] = (float)selected[i];
+    distill_dump_record(0, il, pos, token, payload, off);
+}
+
+static void distill_dump_ffn(
+        ds4_gpu_tensor *t,
+        uint32_t        il,
+        uint32_t        pos,
+        uint32_t        token) {
+    if (!t || !distill_dump_enabled()) return;
+    if (ds4_gpu_synchronize() == 0) {
+        fprintf(stderr, "ds4: distill dump: failed to synchronize before routed_ffn layer %u pos %u\n", il, pos);
+        return;
+    }
+    float *buf = xmalloc((size_t)DS4_N_EMBD * sizeof(buf[0]));
+    if (ds4_gpu_tensor_read(t, 0, buf, (uint64_t)DS4_N_EMBD * sizeof(buf[0])) != 0) {
+        distill_dump_record(1, il, pos, token, buf, (uint32_t)DS4_N_EMBD);
+    }
+    free(buf);
+    if (ds4_gpu_begin_commands() == 0) {
+        fprintf(stderr, "ds4: distill dump: failed to resume command batch after routed_ffn layer %u pos %u\n", il, pos);
+    }
+}
+
 static bool metal_graph_needs_ffn_out(const ds4_gpu_graph *g, uint32_t il, uint32_t pos) {
     return metal_graph_directional_steering_ffn_enabled(g) ||
            g->materialize_ffn_out ||
@@ -20932,6 +21131,7 @@ static bool metal_graph_decode_cpu_router(
         const ds4_model        *model,
         const ds4_layer_weights *layer,
         uint32_t                il,
+        uint32_t                pos,
         uint32_t                token) {
     const bool profile =
         getenv("DS4_METAL_PRO_Q4_CPU_ROUTER_PROFILE") != NULL ||
@@ -20965,6 +21165,9 @@ static bool metal_graph_decode_cpu_router(
     }
     for (uint32_t i = 0; i < DS4_N_EXPERT_USED; i++) {
         selected_i32[i] = (int32_t)selected[i];
+    }
+    if (distill_dump_enabled()) {
+        distill_dump_router(il, pos, token, logits, probs, weights, selected);
     }
     const double t_cpu = profile ? now_sec() : 0.0;
 
@@ -23751,7 +23954,7 @@ static bool metal_graph_encode_decode_layer_phase(
     const uint64_t down_row_bytes = routed_expert_row_bytes(layer->ffn_down_exps);
     const uint64_t down_expert_bytes DS4_MAYBE_UNUSED = routed_out_dim * down_row_bytes;
     if (ok && metal_graph_decode_cpu_router_applicable(g, layer)) {
-        ok = metal_graph_decode_cpu_router(g, model, layer, il, (uint32_t)token);
+        ok = metal_graph_decode_cpu_router(g, model, layer, il, pos, (uint32_t)token);
     } else {
         if (ok && !metal_graph_tp_ablate("router")) {
         /* Fused router + shared-expert gate/up: one dispatch instead of two
@@ -24432,6 +24635,7 @@ static bool metal_graph_encode_decode_layer_phase(
             metal_graph_debug_dump_tensor("ffn_moe_down", metal_graph_routed_down(g),
                                           (uint64_t)DS4_N_EXPERT_USED * DS4_N_EMBD, il, pos);
             metal_graph_debug_dump_tensor("ffn_moe_out", metal_graph_routed_out(g), DS4_N_EMBD, il, pos);
+            distill_dump_ffn(metal_graph_routed_out(g), il, pos, (uint32_t)token);
         }
         if (ok && fuse_shared_down_hc) {
             ok = ds4_gpu_shared_down_hc_expand_q8_0_tensor(metal_graph_after_ffn_hc(g),
@@ -24638,6 +24842,7 @@ static bool metal_graph_encode_decode_layer_phase(
             metal_graph_debug_dump_tensor("ffn_moe_down", metal_graph_routed_down(g),
                                           (uint64_t)DS4_N_EXPERT_USED * DS4_N_EMBD, il, pos);
             metal_graph_debug_dump_tensor("ffn_moe_out", metal_graph_routed_out(g), DS4_N_EMBD, il, pos);
+            distill_dump_ffn(metal_graph_routed_out(g), il, pos, (uint32_t)token);
         }
         if (ok && fuse_shared_down_hc) {
             ok = ds4_gpu_shared_down_hc_expand_q8_0_tensor(metal_graph_after_ffn_hc(g),
@@ -24766,6 +24971,7 @@ static bool metal_graph_encode_decode_layer_phase(
     }
     if (ok) {
         metal_graph_debug_dump_tensor("ffn_moe_out", metal_graph_routed_out(g), DS4_N_EMBD, il, pos);
+        distill_dump_ffn(metal_graph_routed_out(g), il, pos, (uint32_t)token);
     }
     if (phase == METAL_DECODE_LAYER_TO_SHARED_MID ||
         phase == METAL_DECODE_LAYER_FROM_QA_KV_RAW_TO_SHARED_MID) {
@@ -58078,6 +58284,46 @@ void ds4_engine_summary(ds4_engine *e) {
                    e->dspark_weights.metadata_errors);
         }
     }
+}
+
+void ds4_engine_shape_dump(ds4_engine *e) {
+    (void)e;
+    printf("shape: %s\n", DS4_MODEL_SHAPE_NAME);
+    printf("family: %s\n", DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK4
+                                ? "deepseek4" : "glm-dsa");
+    printf("variant: %s\n",
+           DS4_MODEL_VARIANT == DS4_VARIANT_FLASH ? "flash" :
+           DS4_MODEL_VARIANT == DS4_VARIANT_PRO   ? "pro"   : "glm52");
+    printf("n_layer: %u\n", DS4_N_LAYER);
+    printf("n_embd: %u\n", DS4_N_EMBD);
+    printf("n_vocab: %u\n", DS4_N_VOCAB);
+    printf("n_head: %u\n", DS4_N_HEAD);
+    printf("n_head_kv: %u\n", DS4_N_HEAD_KV);
+    printf("n_head_dim: %u\n", DS4_N_HEAD_DIM);
+    printf("n_value_dim: %u\n", DS4_N_VALUE_DIM);
+    printf("n_rot: %u\n", DS4_N_ROT);
+    printf("n_out_group: %u\n", DS4_N_OUT_GROUP);
+    printf("n_lora_q: %u\n", DS4_N_LORA_Q);
+    printf("n_lora_o: %u\n", DS4_N_LORA_O);
+    printf("n_expert: %u\n", DS4_N_EXPERT);
+    printf("n_expert_used: %u\n", DS4_N_EXPERT_USED);
+    printf("n_expert_shared: %u\n", DS4_N_EXPERT_SHARED);
+    printf("n_ff_exp: %u\n", DS4_N_FF_EXP);
+    printf("n_hash_layer: %u\n", DS4_N_HASH_LAYER);
+    printf("n_swa: %u\n", DS4_N_SWA);
+    printf("n_indexer_head: %u\n", DS4_N_INDEXER_HEAD);
+    printf("n_indexer_head_dim: %u\n", DS4_N_INDEXER_HEAD_DIM);
+    printf("n_indexer_top_k: %u\n", DS4_N_INDEXER_TOP_K);
+    printf("n_hc: %u\n", DS4_N_HC);
+    printf("n_hc_sinkhorn_iter: %u\n", DS4_N_HC_SINKHORN_ITER);
+    printf("n_ff_dense: %u\n", DS4_N_FF_DENSE);
+    printf("n_nextn_predict: %u\n", DS4_N_NEXTN_PREDICT);
+    printf("n_leading_dense: %u\n", DS4_N_LEADING_DENSE);
+    printf("n_kv_lora: %u\n", DS4_N_KV_LORA);
+    printf("n_key_mla: %u\n", DS4_N_KEY_MLA);
+    printf("n_value_mla: %u\n", DS4_N_VALUE_MLA);
+    printf("expert_weight_scale: %.6f\n", (double)DS4_EXPERT_WEIGHT_SCALE);
+    printf("rope_orig_ctx: %llu\n", (unsigned long long)DS4_ROPE_ORIG_CTX);
 }
 
 int ds4_engine_vocab_size(ds4_engine *e) {
