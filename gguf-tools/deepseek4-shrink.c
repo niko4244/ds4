@@ -1026,6 +1026,10 @@ static void usage(const char *argv0) {
     printf("  --layers CSV          only shrink routed layers (e.g. 0 or 0,1,2; default: all)\n");
     printf("  --emit-selected       write only the tensors being shrunk (proof mode)\n");
     printf("  --no-mtp              skip mtp.N.* expert tensors\n");
+    printf("  --no-shexp            skip ffn_*_shexp (shared-expert, always-active)\n");
+    printf("                        tensors; routed experts still shrink. Requires an\n");
+    printf("                        engine build with an independent shared-expert\n");
+    printf("                        width field (DS4_N_FF_SHEXP)\n");
     printf("  --imatrix FILE        imatrix: legacy .dat or GGUF with imatrix.* tensors\n");
     printf("  --imatrix-strict      fail if a shrunk tensor has no matching imatrix\n");
     printf("  --threads N           expert worker count, default 4\n");
@@ -1050,7 +1054,7 @@ static void dump_tensors(const gguf_file *g, const char *label) {
 }
 
 static void print_plan(const gguf_file *in, int64_t divide, const bool *layer_sel,
-                       bool mtp, const imatrix_store *imatrix) {
+                       bool mtp, bool shexp, const imatrix_store *imatrix) {
     (void)imatrix;
     size_t in_total = 0, out_total = 0;
     int n_shrunk = 0;
@@ -1058,7 +1062,7 @@ static void print_plan(const gguf_file *in, int64_t divide, const bool *layer_se
         const tensor_meta *t = &in->tensors[i];
         in_total += t->size;
         expert_tensor e = parse_expert_tensor(t->name);
-        bool shrink = e.is_expert &&
+        bool shrink = e.is_expert && (shexp || !e.is_shared) &&
             ((!e.is_mtp && layer_sel[e.layer]) || (e.is_mtp && mtp && layer_sel[e.layer]));
         if (shrink) {
             /* down (part==1) is [hidden, embd]: slice columns; gate/up slice rows */
@@ -1198,7 +1202,7 @@ int main(int argc, char **argv) {
     const char *layers_csv = NULL, *validate_name = NULL;
     int64_t divide = 4;
     int n_threads = 4;
-    bool mtp = true, dry_run = false, dump = false, overwrite = false, imatrix_strict = false;
+    bool mtp = true, shexp = true, dry_run = false, dump = false, overwrite = false, imatrix_strict = false;
     bool emit_selected = false;
     bool resume = false;
 
@@ -1208,6 +1212,7 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--divide") == 0) divide = atol(argv[++i]);
         else if (strcmp(argv[i], "--layers") == 0) layers_csv = argv[++i];
         else if (strcmp(argv[i], "--no-mtp") == 0) mtp = false;
+        else if (strcmp(argv[i], "--no-shexp") == 0) shexp = false;
         else if (strcmp(argv[i], "--emit-selected") == 0) emit_selected = true;
         else if (strcmp(argv[i], "--resume") == 0) resume = true;
         else if (strcmp(argv[i], "--imatrix") == 0) imatrix_path = argv[++i];
@@ -1256,7 +1261,7 @@ int main(int argc, char **argv) {
     }
 
     if (dry_run) {
-        print_plan(&in, divide, layer_sel, mtp, &imatrix);
+        print_plan(&in, divide, layer_sel, mtp, shexp, &imatrix);
         imatrix_free(&imatrix);
         free_gguf_file(&in);
         return 0;
@@ -1272,7 +1277,7 @@ int main(int argc, char **argv) {
     for (uint64_t i = 0; i < in.n_tensors; i++) {
         tensor_meta *t = &in.tensors[i];
         expert_tensor e = parse_expert_tensor(t->name);
-        bool shrink = e.is_expert &&
+        bool shrink = e.is_expert && (shexp || !e.is_shared) &&
                     ((!e.is_mtp && layer_sel[e.layer]) || (e.is_mtp && mtp && layer_sel[e.layer]));
         t->shrink = shrink;
         t->emit = !emit_selected || shrink;
