@@ -2775,7 +2775,13 @@ extern "C" int ds4_gpu_init(void) {
 }
 
 extern "C" void ds4_gpu_cleanup(void) {
-    (void)cudaDeviceSynchronize();
+    /* No cudaDeviceSynchronize() here: this runs only at process exit, the
+     * OS reclaims the device regardless of in-flight work, and
+     * cudaStreamDestroy/cudaEventDestroy below are documented safe to call
+     * on non-idle streams (resources release asynchronously once pending
+     * work completes). A blind synchronize here was observed segfaulting
+     * deep inside the driver's PTX JIT compiler on this host/CUDA 13.3
+     * combination, reproducibly, across two separate driver installs. */
     g_current_logical_tier = -1;
 
     /* Multi-GPU teardown: events, streams, cublas handles, scratch
